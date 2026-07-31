@@ -2,12 +2,12 @@
  * Context-Mode Hook для MiMoCode
  * Интеграция context-mode MCP capabilities: auto-indexing, smart redirect, repo indexing
  *
- * Автоматически:
- * - Индексирует большие outputs (>100KB) через ctx_index
- * - Логирует потенциально большие outputs (>5KB) для intent-driven search
- * - Индексирует git repo на session.start
- * - Сохраняет session snapshot при compaction
- * - Перенаправляет большие read_file через ctx_execute_file (логирует)
+ * Automatically:
+ * - Indexes large outputs (>100KB) via ctx_index
+ * - Logs potentially large outputs (>5KB) for intent-driven search
+ * - Indexes git репо on session.start
+ * - Saves session snapshot при compaction
+ * - Redirects large read_file через ctx_execute_file (logs recommendation)
  */
 
 import * as fs from "fs";
@@ -25,7 +25,7 @@ function log(message: string): void {
 
 const CONFIG = {
   before: true,           // Tool.execute.before — smart redirect для больших файлов
-  after: true,            // Tool.execute.after — индексирование больших outputs (>100KB)
+  after: true,            // Tool.execute.after — автоиндекс больших outputs (>100KB)
   intentSearch: true,     // Tool.execute.after — intent-driven search для outputs >5KB
   compact: true,          // Session.compacting — сохранение индекса
   repo: true,             // Session.start — repo indexing

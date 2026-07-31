@@ -1,122 +1,90 @@
-# MiMoCode Context-Mode Hook
+# mimocode-context-mode-hook
 
-Интеграция [context-mode](https://github.com/mksglu/context-mode) MCP сервера с MiMoCode file hooks системой.
+MiMoCode file hook integrating [context-mode](https://github.com/mksglu/context-mode) MCP server for automatic context optimization.
 
-Автоматически:
-- Индексирует большие outputs (>100KB) через `ctx_index`
-- Логирует потенциально большие outputs (>5KB) для intent-driven search
-- Индексирует git репо на `session.start`
-- Сохраняет session snapshot при `session.compacting`
-- Перенаправляет большие `read_file` через `ctx_execute_file` (логирует)
+## What It Does
 
-## Установка
+Your AI agent drowning in large file outputs and repetitive searches? This hook integrates context-mode's MCP tools into MiMoCode's file hook system — auto-indexing large results, smart file reading redirects, and session lifecycle management.
 
-1. Убедитесь что context-mode MCP сервер подключён в `~/.config/mimocode/mimocode.json`:
+### Features
 
-```json
-{
-  "mcp": {
-    "context-mode": {
-      "type": "local",
-      "command": ["node", "/path/to/context-mode/server.bundle.mjs"],
-      "enabled": true
-    }
-  }
-}
-```
+- **Auto-index large outputs** (>100KB) — saves context by replacing huge outputs with searchable pointers
+- **Smart file redirect** — recommends `ctx_execute_file` for large file reads
+- **Intent-driven search** — marks outputs >5KB as searchable via `ctx_search`
+- **Repo indexing on session start** — auto-indexes git repo files
+- **Session snapshot on compaction** — preserves key decisions before context compaction
+- **Web integration** — routes web_fetch/web_search through context-mode for indexed retrieval
 
-2. Скопируйте хук в директорию MiMoCode hooks:
+## Quick Start
 
 ```bash
-mkdir -p ~/.config/mimocode/hooks
+# 1. Copy the hook
 cp hooks/context-mode.ts ~/.config/mimocode/hooks/
-```
 
-3. Перезапустите MiMoCode:
-
-```bash
+# 2. Ensure context-mode MCP is configured in ~/.config/mimocode/mimocode.json
+# 3. Restart MiMoCode
 mimo --trust
 ```
 
-## Конфигурация
+## Configuration
 
-Все настройки находятся в начале файла `hooks/context-mode.ts`:
+All options are in `hooks/context-mode.ts`:
 
-| Опция | По умолчанию | Описание |
-|-------|-------------|----------|
-| `before` | `true` | Активировать tool.execute.before логику |
-| `after` | `true` | Автоиндекс больших outputs (>100KB) |
-| `intentSearch` | `true` | Mark outputs >5KB как intent-searchable |
-| `compact` | `true` | Session snapshot при compaction |
-| `repo` | `true` | Автоиндексация репо на session.start |
-| `web` | `true` | Web fetch через ctx_fetch_and_index |
-| `indexThreshold` | `102400` (100KB) | Порог для auto-index |
-| `intentThreshold` | `5000` (5KB) | Порог для intent-driven search |
-| `skipTools` | `['write', 'edit']` | Tools НЕ индексировать |
+| Option | Default | Description |
+|--------|---------|-------------|
+| `before` | `true` | Enable before-hook logic |
+| `after` | `true` | Auto-index large outputs (>100KB) |
+| `intentSearch` | `true` | Mark outputs >5KB as intent-searchable |
+| `compact` | `true` | Session snapshot on compaction |
+| `repo` | `true` | Git repo auto-indexing on session start |
+| `web` | `true` | Web fetch routing through context-mode |
+| `indexThreshold` | `102400` | Auto-index threshold (100KB) |
+| `intentThreshold` | `5000` | Intent-searchable threshold (5KB) |
+| `skipTools` | `['write', 'edit']` | Tools excluded from indexing |
 
-Измените конфиг:
+## Hooks
 
-```typescript
-const CONFIG = {
-  before: true,
-  after: false,    // Отключить auto-index
-  intentSearch: true,
-  ...
-};
-```
+### `tool.execute.before`
+- Intercepts `read_file` with large files (>100KB) → logs recommendation to use `ctx_execute_file`
+- Detects bash commands likely to produce large output (grep, find, ls, cat, rg)
+- Logs web fetch/search routing recommendations
 
-## Как это работает
+### `tool.execute.after`
+- **Auto-index** outputs >100KB: replaces output with `ctx_search` pointer
+- **Intent-driven search**: marks outputs >5KB with `contextModeIndexed: true` metadata
 
-### Auto-indexing (tool.execute.after)
+### `experimental.session.compacting`
+- Logs recommendation to save session summary via `ctx_stats`
+- Logs recommendation to preserve key decisions via `ctx_search`
 
-Для outputs > 100KB:
-- Индексирует контент через `ctx_index`
-- Заменяет output на pointer: `Output indexed (150 bytes) → search with ctx_search(...)`
-- Добавляет `contextModeIndexed: true` в metadata
-
-Для outputs > 5KB (но < 100KB):
-- Добавляет `contextModeIndexed: true` в metadata (intent-driven search)
-
-### Large file redirect (tool.execute.before)
-
-Для `read_file` с файлами > 100KB:
-- Логирует рекомендацию использовать `ctx_execute_file`
-- Не модифицирует вызов (MCP tool недоступен из хука)
-
-### Web integration (tool.execute.before)
-
-Для `web_fetch`/`web_search`:
-- Логирует роутинг через `ctx_fetch_and_index` + `ctx_search`
-
-### Session lifecycle
-
-- **session.start**: Auto-index git репо (ctx_batch_execute с git ls-files)
-- **session.compacting**: Сохраняет session snapshot (ctx_stats + ctx_search)
+### `event`
+- `session.start`: Detects git repo, logs repo indexing intent
+- `session.stop`: Cleanup log
 
 ## Debug
-
-Логи пишутся в `/tmp/context-mode-hook.log`:
 
 ```bash
 tail -f /tmp/context-mode-hook.log
 ```
 
-Пример вывода:
+Example output:
 ```
 [2026-07-31T09:36:51.091Z] before: bash session=ses_06f06737fffe5Phs2FzA02RweL
 [2026-07-31T09:36:50.341Z] event: session.status session=unknown
 ```
 
-## Тесты
+## Testing
 
 ```bash
 bun install
 bun test
 ```
 
-44 теста, 77 assertions — все pass.
+44 tests, 77 assertions — all passing.
 
-## Архитектура
+## How It Works
+
+### Architecture
 
 ```
 ┌─────────────────────────────────────────┐
@@ -137,11 +105,19 @@ bun test
 └─────────────────────────────────────────┘
 ```
 
+### Flow
+
+1. **before hook** fires when user invokes a tool (`read_file`, `bash`, `web_fetch`)
+2. Hook checks output size, logs recommendations to use context-mode tools
+3. **after hook** fires with tool results
+4. For large outputs (>100KB), hook replaces output with searchable pointer
+5. All indexed content tagged with `mimocode-session-{sessionID}` for session isolation
+
 ## Limitations
 
-- Хук не может напрямую вызывать MCP tools (ctx_index, ctx_execute_file) — только логирует рекомендации
-- Session ID в events может быть `unknown` (особенность MiMoCode event system)
-- Real redirect read_file → ctx_execute_file требует изменений в MiMoCode core
+- Hook logs recommendations but cannot directly invoke MCP tools from file hooks
+- Session ID may be `unknown` in some event types (MiMoCode event system limitation)
+- Real redirect (read_file → ctx_execute_file) requires MiMoCode core changes
 
 ## License
 
