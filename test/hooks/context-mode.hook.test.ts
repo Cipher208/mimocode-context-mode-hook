@@ -248,7 +248,10 @@ describe("tool.execute.after logic", () => {
 
   test("adds contextModeIndexed metadata for intent-searchable outputs", () => {
     const mediumOutput = "x".repeat(5001);
-    const output = { output: mediumOutput, metadata: {} };
+    const output: { output: string; metadata: Record<string, unknown> } = {
+      output: mediumOutput,
+      metadata: {},
+    };
     const outputData = getOutputData(output);
 
     if (CONFIG.intentSearch && outputData.length > CONFIG.intentThreshold) {
@@ -277,7 +280,7 @@ describe("event handler logic", () => {
   });
 
   test("identifies non-session events", () => {
-    const eventType = "metrics.tool_call";
+    const eventType: string = "metrics.tool_call";
     expect(eventType === "session.start").toBe(false);
     expect(eventType === "session.stop" || eventType === "session.end").toBe(false);
   });
@@ -289,7 +292,9 @@ describe("event handler logic", () => {
   });
 
   test("returns unknown sessionID when missing", () => {
-    const input = { event: { type: "metrics.tool_call" } };
+    const input: { event: { type: string; sessionID?: string } } = {
+      event: { type: "metrics.tool_call" },
+    };
     const sessionId = input.event?.sessionID || "unknown";
     expect(sessionId).toBe("unknown");
   });
