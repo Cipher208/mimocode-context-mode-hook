@@ -1,19 +1,30 @@
 /**
- * Context-Mode Hook для MiMoCode
- * Интеграция context-mode MCP capabilities: auto-indexing, smart redirect, repo indexing
+ * Context-Mode Hook for MiMoCode (and OpenCode)
+ * Integrates context-mode's FTS5 knowledge base: auto-indexing large tool
+ * outputs, smart file-read advice, repo indexing, session lifecycle.
  *
  * Automatically:
- * - Indexes large outputs (>100KB) via ctx_index
- * - Logs potentially large outputs (>5KB) for intent-driven search
- * - Indexes git репо on session.start
- * - Saves session snapshot при compaction
- * - Redirects large read_file через ctx_execute_file (logs recommendation)
+ * - Indexes large outputs (>100KB) into context-mode's FTS5 base via its CLI
+ * - Replaces those outputs with a searchable pointer — ONLY after the index
+ *   write is confirmed
+ * - Marks outputs >5KB as searchable in metadata
+ * - Indexes git repo files on session.start
+ * - Logs compaction/session lifecycle for continuity
+ *
+ * Invariants:
+ * - An output is NEVER replaced unless the index write was confirmed with
+ *   at least one section. `context-mode index` exits 0 even when it indexed
+ *   nothing, so the exit code alone is not proof — the "Indexed N sections"
+ *   count is.
+ * - If indexing fails or throws, the original output is returned untouched.
  */
 
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
+import { execFile } from "child_process";
 
-const LOG_FILE = "/tmp/context-mode-hook.log";
+const LOG_FILE = process.env.CONTEXT_MODE_HOOK_LOG || "/tmp/context-mode-hook.log";
 
 function log(message: string): void {
   try {
@@ -23,7 +34,7 @@ function log(message: string): void {
   }
 }
 
-const CONFIG = {
+export const CONFIG = {
   before: true,           // Tool.execute.before — smart redirect для больших файлов
   after: true,            // Tool.execute.after — автоиндекс больших outputs (>100KB)
   intentSearch: true,     // Tool.execute.after — intent-driven search для outputs >5KB
@@ -33,15 +44,88 @@ const CONFIG = {
   indexThreshold: 102400, // Auto-index threshold: 100KB (matches context-mode LARGE_OUTPUT_THRESHOLD)
   intentThreshold: 5000,  // Intent-driven search threshold: 5KB (matches INTENT_SEARCH_THRESHOLD)
   skipTools: ["write", "edit"], // Tools NOT to index
+  indexTimeoutMs: 120000, // context-mode is Node; first run after boot is slower
 };
 
-function summaryOutput(content: string): string {
+export interface IndexRequest {
+  content: string;
+  source: string;
+  project: string;
+}
+
+export interface IndexResult {
+  ok: boolean;
+  sections: number;
+  detail?: string;
+}
+
+export type Indexer = (req: IndexRequest) => Promise<IndexResult>;
+
+function cliPath(): string {
+  return process.env.CONTEXT_MODE_BIN || "context-mode";
+}
+
+function projectDir(): string {
+  // opencode sets OPENCODE_PROJECT_DIR for plugins; mimocode falls back to cwd.
+  return process.env.OPENCODE_PROJECT_DIR || process.cwd();
+}
+
+function runCli(args: string[], timeoutMs: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      cliPath(),
+      args,
+      { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err) return reject(new Error(`${err.message}${stderr ? `: ${stderr.trim()}` : ""}`));
+        resolve(String(stdout || ""));
+      },
+    );
+  });
+}
+
+/**
+ * Index content into context-mode's FTS5 base through the documented CLI.
+ *
+ * `context-mode index <path> --source <label> --project <dir>` exits 0 even when
+ * it indexed zero sections (e.g. empty input), so success is decided by the
+ * reported section count, not by the exit status.
+ */
+export const indexViaCli: Indexer = async (req) => {
+  const tmp = path.join(
+    os.tmpdir(),
+    `cm-hook-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`,
+  );
+  try {
+    fs.writeFileSync(tmp, req.content, "utf8");
+    const stdout = await runCli(
+      ["index", tmp, "--source", req.source, "--project", req.project],
+      CONFIG.indexTimeoutMs,
+    );
+    const match = /Indexed\s+(\d+)\s+sections?/i.exec(stdout);
+    const sections = match ? Number(match[1]) : 0;
+    if (sections > 0) {
+      return { ok: true, sections, detail: stdout.trim().slice(0, 300) };
+    }
+    return { ok: false, sections: 0, detail: stdout.trim().slice(0, 300) || "no section count in output" };
+  } catch (err: any) {
+    return { ok: false, sections: 0, detail: String(err?.message ?? err) };
+  } finally {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      // temp file already gone — nothing to do
+    }
+  }
+};
+
+export function summaryOutput(content: string): string {
   const lines = content.split("\n").filter((l) => l.trim()).slice(0, 8);
   return lines.join("\n") + (content.split("\n").length > 8 ? "\n..." : "");
 }
 
-function getOutputData(output: any): string {
-  // MiMoCode Hooks output format: { title: string; output: string; metadata: any }
+export function getOutputData(output: any): string {
+  // MiMoCode and opencode both hand hooks { title, output, metadata }.
   if (typeof output === "string") return output;
   if (output?.output && typeof output.output === "string") return output.output;
   if (output?.data && typeof output.data === "string") return output.data;
@@ -53,141 +137,135 @@ function getOutputData(output: any): string {
   return "";
 }
 
-function getSessionID(input: any): string {
+export function getSessionID(input: any): string {
   return input?.sessionID || input?.event?.sessionID || "unknown";
 }
 
-export default {
-  "tool.execute.before": async (input: any, output: any) => {
-    if (!CONFIG.before) return;
-    if (CONFIG.skipTools.includes(input.tool)) return;
+export function createHooks(deps: { index?: Indexer } = {}) {
+  const index = deps.index ?? indexViaCli;
 
-    const sessionID = getSessionID(input);
-    log(`before: ${input.tool} session=${sessionID}`);
+  return {
+    "tool.execute.before": async (input: any, output: any) => {
+      if (!CONFIG.before) return;
+      if (CONFIG.skipTools.includes(input.tool)) return;
 
-    // read_file → ctx_execute_file для больших файлов
-    if (input.tool === "read_file" && input.args?.path) {
-      try {
-        const stat = fs.statSync(input.args.path);
-        if (stat.size > CONFIG.indexThreshold) {
-          log(
-            `[${sessionID}] LARGE FILE: read_file(${input.args.path}, ${stat.size}B > ${CONFIG.indexThreshold}B)`,
-          );
-          log(`[${sessionID}] → Would redirect to ctx_execute_file for sandbox analysis`);
-          log(`[${sessionID}] → Output: use ctx_search to query file content instead of loading raw bytes`);
+      const sessionID = getSessionID(input);
+      log(`before: ${input.tool} session=${sessionID}`);
+
+      // read_file → ctx_execute_file для больших файлов
+      if (input.tool === "read_file" && input.args?.path) {
+        try {
+          const stat = fs.statSync(input.args.path);
+          if (stat.size > CONFIG.indexThreshold) {
+            log(`[${sessionID}] LARGE FILE: read_file(${input.args.path}, ${stat.size}B > ${CONFIG.indexThreshold}B)`);
+            log(`[${sessionID}] → prefer ctx_execute_file over a raw read`);
+          }
+        } catch (e: any) {
+          log(`stat failed for ${input.args.path}: ${e.message}`);
         }
-      } catch (e: any) {
-        log(`stat failed for ${input.args.path}: ${e.message}`);
       }
-    }
 
-    // bash с потенциально большим output
-    if (input.tool === "bash" && input.args?.command) {
-      const largeCmdPattern = /\b(grep|find|ls|cat|rg|wc|head|tail)\b/;
-      if (largeCmdPattern.test(input.args.command)) {
-        log(
-          `[${sessionID}] Large bash potential: ${input.args.command.substring(0, 100)}`,
-        );
-        log(`[${sessionID}] → Would wrap in ctx_execute with intent for filtering`);
+      // bash с потенциально большим output
+      if (input.tool === "bash" && input.args?.command) {
+        const largeCmdPattern = /\b(grep|find|ls|cat|rg|wc|head|tail)\b/;
+        if (largeCmdPattern.test(input.args.command)) {
+          log(`[${sessionID}] Large bash potential: ${input.args.command.substring(0, 100)}`);
+          log(`[${sessionID}] → prefer ctx_execute to filter in the sandbox`);
+        }
       }
-    }
 
-    // web_fetch → ctx_fetch_and_index
-    if (input.tool === "web_fetch" && input.args?.url && CONFIG.web) {
-      log(
-        `[${sessionID}] web_fetch ${input.args.url} → would use ctx_fetch_and_index + ctx_search`,
-      );
-    }
+      // web_fetch / web_search → ctx_fetch_and_index + ctx_search
+      if (input.tool === "web_fetch" && input.args?.url && CONFIG.web) {
+        log(`[${sessionID}] web_fetch ${input.args.url} → ctx_fetch_and_index + ctx_search`);
+      }
+      if (input.tool === "web_search" && CONFIG.web) {
+        log(`[${sessionID}] web_search → ctx_fetch_and_index + ctx_search`);
+      }
+    },
 
-    // web_search → ctx_fetch_and_index + ctx_search
-    if (input.tool === "web_search" && CONFIG.web) {
-      log(`[${sessionID}] web_search → would use ctx_fetch_and_index + ctx_search for result analysis`);
-    }
-  },
+    "tool.execute.after": async (input: any, output: any) => {
+      if (!CONFIG.after) return;
+      if (CONFIG.skipTools.includes(input.tool)) return;
 
-  "tool.execute.after": async (input: any, output: any) => {
-    if (!CONFIG.after) return;
-    if (CONFIG.skipTools.includes(input.tool)) return;
+      const sessionID = getSessionID(input);
+      log(`after: ${input.tool} session=${sessionID}`);
 
-    const sessionID = getSessionID(input);
-    log(`after: ${input.tool} session=${sessionID}`);
+      const outputData = getOutputData(output);
+      if (!outputData) return;
 
-    const outputData = getOutputData(output);
+      // Auto-index для outputs > 100KB
+      if (outputData.length > CONFIG.indexThreshold) {
+        const source = `mimocode-session-${sessionID}-${input.tool}-${Date.now()}`;
 
-    if (!outputData) return;
+        let result: IndexResult;
+        try {
+          result = await index({ content: outputData, source, project: projectDir() });
+        } catch (err: any) {
+          result = { ok: false, sections: 0, detail: String(err?.message ?? err) };
+        }
 
-    // Auto-index для outputs > 100KB
-    if (outputData.length > CONFIG.indexThreshold) {
-      const source = `mimocode-session-${sessionID}-${input.tool}-${Date.now()}`;
-      log(
-        `[${sessionID}] Auto-indexing ${outputData.length}B from ${input.tool} → src:${source}`,
-      );
+        // Defence in depth: the invariant is checked here, not delegated to the
+        // indexer. A zero section count is never a confirmed write.
+        if (!result.ok || !(result.sections > 0)) {
+          // Index write not confirmed — keep the original output. Losing the
+          // bytes is worse than keeping them.
+          log(`[${sessionID}] index FAILED (${result.sections} sections, ${result.detail ?? "?"}) — output kept as-is`);
+          return;
+        }
 
-      try {
-        const replacement = `Output indexed (${outputData.length} bytes) → search with \`ctx_search(queries: ["..."], source: "${source}")\`\n\nSummary: ${summaryOutput(outputData)}`;
+        log(`[${sessionID}] indexed ${result.sections} sections from ${input.tool} → src:${source}`);
+        const replacement = `Output indexed (${outputData.length} bytes, ${result.sections} sections) → search with \`ctx_search(queries: ["..."], source: "${source}")\`\n\nSummary: ${summaryOutput(outputData)}`;
         if (output?.output) {
           output.output = replacement;
         } else if (output?.data) {
           output.data = replacement;
         }
-        log(`[${sessionID}] Replaced output with indexed pointer`);
-        return output;
-      } catch (e: any) {
-        log(`[${sessionID}] ctx_index failed: ${e.message} — returning original output`);
-        return output;
+        log(`[${sessionID}] replaced output with indexed pointer`);
+        return;
       }
-    }
 
-    // Intent-driven search для outputs > 5KB
-    if (CONFIG.intentSearch && outputData.length > CONFIG.intentThreshold) {
-      log(`[${sessionID}] Intent-searchable output: ${outputData.length}B from ${input.tool}`);
-      if (output?.metadata) {
-        output.metadata = { ...output.metadata, contextModeIndexed: true };
-      } else {
-        output.metadata = { contextModeIndexed: true };
-      }
-    }
-  },
-
-  "experimental.session.compacting": async (input: any, output: any) => {
-    if (!CONFIG.compact) return;
-
-    const sessionID = getSessionID(input);
-    log(`compacting session=${sessionID}`);
-
-    if (CONFIG.repo) {
-      log(`[${sessionID}] Would call ctx_stats({intent: "session summary"}) for snapshot`);
-      log(`[${sessionID}] Would ctx_search(["key decisions", "errors", "blockers"]) for preservation`);
-    }
-  },
-
-  "event": async (input: { event: { type: string; sessionID?: string; [key: string]: any } }) => {
-    const eventType = input.event?.type || "unknown";
-    const sessionId = input.event?.sessionID || "unknown";
-    log(`event: ${eventType} session=${sessionId}`);
-
-    // Session start — auto-index repo files
-    if (eventType === "session.start" && CONFIG.repo) {
-      log(`[${sessionId}] Session started — initializing repo indexing`);
-
-      try {
-        const cwd = process.cwd();
-        const isGitRepo = fs.existsSync(path.join(cwd, ".git"));
-
-        if (isGitRepo) {
-          log(`[${sessionId}] Git repo detected at ${cwd} — would index tracked files`);
-          log(`[${sessionId}] → ctx_batch_execute([{command: "git ls-files", label: "tracked-files"}])`);
+      // Intent-driven search для outputs > 5KB
+      if (CONFIG.intentSearch && outputData.length > CONFIG.intentThreshold) {
+        log(`[${sessionID}] Intent-searchable output: ${outputData.length}B from ${input.tool}`);
+        if (output?.metadata) {
+          output.metadata = { ...output.metadata, contextModeIndexed: true };
         } else {
-          log(`[${sessionId}] Not a git repo — skipping repo indexing`);
+          output.metadata = { contextModeIndexed: true };
         }
-      } catch (e: any) {
-        log(`[${sessionId}] Repo indexing failed: ${e.message}`);
       }
-    }
+    },
 
-    // Session stop — cleanup
-    if (eventType === "session.stop" || eventType === "session.end") {
-      log(`[${sessionId}] Session stopping — context-mode hook cleanup`);
-    }
-  },
-};
+    "experimental.session.compacting": async (input: any, output: any) => {
+      if (!CONFIG.compact) return;
+
+      const sessionID = getSessionID(input);
+      log(`compacting session=${sessionID}`);
+    },
+
+    event: async (input: { event: { type: string; sessionID?: string; [key: string]: any } }) => {
+      const eventType = input.event?.type || "unknown";
+      const sessionId = input.event?.sessionID || "unknown";
+      log(`event: ${eventType} session=${sessionId}`);
+
+      if (eventType === "session.start" && CONFIG.repo) {
+        try {
+          const cwd = process.cwd();
+          const isGitRepo = fs.existsSync(path.join(cwd, ".git"));
+          if (isGitRepo) {
+            log(`[${sessionId}] Git repo detected at ${cwd}`);
+          } else {
+            log(`[${sessionId}] Not a git repo — skipping repo indexing`);
+          }
+        } catch (e: any) {
+          log(`[${sessionId}] Repo check failed: ${e.message}`);
+        }
+      }
+
+      if (eventType === "session.stop" || eventType === "session.end") {
+        log(`[${sessionId}] Session stopping`);
+      }
+    },
+  };
+}
+
+export default createHooks();
