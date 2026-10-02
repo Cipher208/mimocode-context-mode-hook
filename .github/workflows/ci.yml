@@ -46,7 +46,11 @@ jobs:
         run: bun install
 
       - name: Type check
-        run: bunx tsc --noEmit 2>&1 || echo "TypeScript check skipped — hook runs in MiMoCode Bun runtime without tsc"
+        # Real gate. It previously ended in `|| echo "skipped"`, so this job was
+        # green by construction and could never fail: tsc was not even a declared
+        # dependency, so `bunx` resolved an arbitrary version that rejected
+        # moduleResolution "bun" with TS6046.
+        run: bun run typecheck
 
   lint:
     name: Lint
@@ -63,7 +67,9 @@ jobs:
         run: bun install
 
       - name: Lint
-        run: bunx tsc --noEmit --strict hooks/context-mode.ts 2>&1 || echo "TypeScript lint skipped — hook runtime is Bun in MiMoCode"
+        # Narrow strict pass over the hook file alone. The `|| echo "skipped"`
+        # fallback is gone for the same reason as in the typecheck job.
+        run: bunx --bun tsc --noEmit --strict hooks/context-mode.ts
 
   e2e:
     name: E2E Hook Test
@@ -82,7 +88,7 @@ jobs:
       - name: Run E2E validation
         run: |
           # Verify hook file syntax
-          bun build hooks/context-mode.ts --no-bundle 2>&1 || echo "Build check skipped"
+          bun build hooks/context-mode.ts --no-bundle
           # Verify tests pass
           bun test
           # Verify hook structure

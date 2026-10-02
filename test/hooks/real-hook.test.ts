@@ -158,7 +158,11 @@ describe("intent search marker", () => {
     const { index } = fakeIndexer({ ok: true, sections: 1 });
     const hooks = createHooks({ index });
 
-    const output = { title: "bash", output: "y".repeat(CONFIG.intentThreshold + 10), metadata: {} };
+    const output: { title: string; output: string; metadata: Record<string, unknown> } = {
+      title: "bash",
+      output: "y".repeat(CONFIG.intentThreshold + 10),
+      metadata: {},
+    };
     await hooks["tool.execute.after"](
       { tool: "bash", sessionID: "sess-9", callID: "c9", args: {} } as any,
       output as any,
