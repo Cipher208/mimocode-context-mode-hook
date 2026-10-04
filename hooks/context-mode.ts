@@ -43,6 +43,7 @@ export const CONFIG = {
   web: true,              // Web fetch — ctx_fetch_and_index + ctx_search
   indexThreshold: 102400, // Auto-index threshold: 100KB (matches context-mode LARGE_OUTPUT_THRESHOLD)
   intentThreshold: 5000,  // Intent-driven search threshold: 5KB (matches INTENT_SEARCH_THRESHOLD)
+  partBytes: 32 * 1024,   // Split big outputs so each lands as its own searchable chunk
   skipTools: ["write", "edit"], // Tools NOT to index
   indexTimeoutMs: 120000, // context-mode is Node; first run after boot is slower
 };
@@ -119,6 +120,38 @@ export const indexViaCli: Indexer = async (req) => {
   }
 };
 
+/**
+ * Split a big output into ~maxBytes pieces along line boundaries so each
+ * lands as its own searchable chunk (one 142KB blob indexes as a single
+ * chunk and search shows only its head). Long lines are hard-cut.
+ */
+export function splitParts(content: string, maxBytes: number): string[] {
+  const parts: string[] = [];
+  let cur: string[] = [];
+  let curLen = 0;
+  const flush = () => {
+    if (cur.length) {
+      parts.push(cur.join("\n"));
+      cur = [];
+      curLen = 0;
+    }
+  };
+  for (const line of content.split("\n")) {
+    if (line.length + 1 > maxBytes) {
+      flush();
+      for (let i = 0; i < line.length; i += maxBytes) {
+        parts.push(line.slice(i, i + maxBytes));
+      }
+      continue;
+    }
+    if (cur.length > 0 && curLen + line.length + 1 > maxBytes) flush();
+    cur.push(line);
+    curLen += line.length + 1;
+  }
+  flush();
+  return parts.length ? parts : [""];
+}
+
 export function summaryOutput(content: string): string {
   const lines = content.split("\n").filter((l) => l.trim()).slice(0, 8);
   return lines.join("\n") + (content.split("\n").length > 8 ? "\n..." : "");
@@ -193,28 +226,43 @@ export function createHooks(deps: { index?: Indexer } = {}) {
       const outputData = getOutputData(output);
       if (!outputData) return;
 
-      // Auto-index для outputs > 100KB
+      // Auto-index для outputs > 100KB — частями, чтобы каждая легла
+      // своим чанком (иначе бесструктурный вывод индексируется одним
+      // куском и поиск показывает только его голову).
       if (outputData.length > CONFIG.indexThreshold) {
         const source = `mimocode-session-${sessionID}-${input.tool}-${Date.now()}`;
+        const chunks = splitParts(outputData, CONFIG.partBytes);
 
-        let result: IndexResult;
-        try {
-          result = await index({ content: outputData, source, project: projectDir() });
-        } catch (err: any) {
-          result = { ok: false, sections: 0, detail: String(err?.message ?? err) };
+        let totalSections = 0;
+        let indexOk = true;
+        let indexDetail = "";
+        for (let i = 0; i < chunks.length; i++) {
+          const partSource = chunks.length > 1 ? `${source}#part${i + 1}` : source;
+          let part: IndexResult;
+          try {
+            part = await index({ content: chunks[i], source: partSource, project: projectDir() });
+          } catch (err: any) {
+            part = { ok: false, sections: 0, detail: String(err?.message ?? err) };
+          }
+          if (!part.ok || !(part.sections > 0)) {
+            indexOk = false;
+            indexDetail = part.detail ?? "?";
+            break;
+          }
+          totalSections += part.sections;
         }
 
         // Defence in depth: the invariant is checked here, not delegated to the
         // indexer. A zero section count is never a confirmed write.
-        if (!result.ok || !(result.sections > 0)) {
+        if (!indexOk) {
           // Index write not confirmed — keep the original output. Losing the
           // bytes is worse than keeping them.
-          log(`[${sessionID}] index FAILED (${result.sections} sections, ${result.detail ?? "?"}) — output kept as-is`);
+          log(`[${sessionID}] index FAILED (0/${chunks.length} parts, ${indexDetail}) — output kept as-is`);
           return;
         }
 
-        log(`[${sessionID}] indexed ${result.sections} sections from ${input.tool} → src:${source}`);
-        const replacement = `Output indexed (${outputData.length} bytes, ${result.sections} sections) → search with \`ctx_search(queries: ["..."], source: "${source}")\`\n\nSummary: ${summaryOutput(outputData)}`;
+        log(`[${sessionID}] indexed ${totalSections} sections from ${input.tool} in ${chunks.length} part(s) → src:${source}`);
+        const replacement = `Output indexed (${outputData.length} bytes, ${totalSections} sections, ${chunks.length} part(s)) → search with \`ctx_search(queries: ["..."], source: "${source}")\`\n\nSummary: ${summaryOutput(outputData)}`;
         if (output?.output) {
           output.output = replacement;
         } else if (output?.data) {

@@ -28,23 +28,23 @@ function fakeIndexer(result: Partial<IndexResult> & { calls?: unknown[] }) {
 }
 
 describe("tool.execute.after — indexes before it replaces", () => {
-  test("large output is handed to the indexer and replaced with a pointer", async () => {
+  test("large output is handed to the indexer in parts and replaced with a pointer", async () => {
     const { index, calls } = fakeIndexer({ ok: true, sections: 3 });
     const hooks = createHooks({ index });
 
-    const output = { title: "grep", output: bigOutput(CONFIG.indexThreshold + 1), metadata: {} };
+    const body = bigOutput(CONFIG.indexThreshold + 1);
+    const output = { title: "grep", output: body, metadata: {} };
     await hooks["tool.execute.after"](
       { tool: "bash", sessionID: "sess-1", callID: "c1", args: {} } as any,
       output as any,
     );
 
-    expect(calls.length).toBe(1);
-    expect(calls[0].content.length).toBeGreaterThan(CONFIG.indexThreshold);
+    expect(calls.length).toBeGreaterThan(1);
+    expect(calls.map((c: any) => c.content).join("\n")).toBe(body);
     expect(output.output).toContain("ctx_search");
-    expect(output.output).toContain(calls[0].source);
   });
 
-  test("the source label in the pointer is the one actually indexed", async () => {
+  test("the base source label in the pointer prefixes every indexed part source", async () => {
     const { index, calls } = fakeIndexer({ ok: true, sections: 1 });
     const hooks = createHooks({ index });
 
@@ -54,7 +54,9 @@ describe("tool.execute.after — indexes before it replaces", () => {
       output as any,
     );
 
-    expect(output.output).toContain(calls[0].source);
+    const base = calls[0].source.replace(/#part1$/, "");
+    expect(calls[0].source).toBe(base + "#part1");
+    expect(output.output).toContain(base);
   });
 });
 
