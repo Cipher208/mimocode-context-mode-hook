@@ -8,7 +8,11 @@
 
 ## Reporting a Vulnerability
 
-Report vulnerabilities to murat@vm1282045.cloud.nuxt.network.
+Please report vulnerabilities through GitHub's private vulnerability reporting:
+open the **Security** tab of this repository and choose **Report a vulnerability**.
+This creates a private advisory visible only to the maintainers.
+
+Please do not open a public issue for a security problem.
 
 We will respond within **48 hours**. If confirmed, we will release a patch within **7 days**.
 
